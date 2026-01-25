@@ -16,44 +16,53 @@ use std::path::{Path, PathBuf};
 
 /// Generate a 3D Gaussian splat from an image using SHARP
 ///
-/// This calls the `sharp` CLI tool as a subprocess.
-/// The sharp tool must be installed (e.g., via `pip install -r requirements.txt` in ml-sharp repo)
+/// Uses the downloaded SHARP executable from the model system.
+/// Requires both the executable and model weights to be downloaded via model management.
 ///
 /// # Arguments
 /// * `source_path` - Path to the input image
 /// * `output_dir` - Directory where the .ply file will be generated
-/// * `model_path` - Optional path to the SHARP model checkpoint
+/// * `data_dir` - Data directory for accessing downloaded SHARP components
 ///
 /// # Returns
 /// Path to the generated .ply file
 pub async fn generate_splat_from_image(
 	source_path: &Path,
 	output_dir: &Path,
-	model_path: Option<&Path>,
+	data_dir: &Path,
 ) -> Result<PathBuf> {
 	use tokio::process::Command;
+
+	// Get SHARP manager
+	let sharp_manager = crate::ops::models::SharpManager::new(data_dir);
+
+	// Check if SHARP is available
+	if !sharp_manager.is_available().await {
+		anyhow::bail!(
+			"SHARP not available. Please download SHARP executable and model from Settings > Models"
+		);
+	}
+
+	let sharp_executable = sharp_manager
+		.get_executable_path()
+		.context("SHARP executable not found")?;
+	let model_path = sharp_manager.get_model_path();
 
 	// Ensure output directory exists
 	tokio::fs::create_dir_all(output_dir).await?;
 
 	// Build command
-	let mut cmd = Command::new("sharp");
-	cmd.arg("predict")
+	let output = Command::new(&sharp_executable)
+		.arg("predict")
 		.arg("-i")
 		.arg(source_path)
 		.arg("-o")
-		.arg(output_dir);
-
-	// Add model path if provided
-	if let Some(model) = model_path {
-		cmd.arg("-c").arg(model);
-	}
-
-	// Execute
-	let output = cmd
+		.arg(output_dir)
+		.arg("-c")
+		.arg(&model_path)
 		.output()
 		.await
-		.context("Failed to execute 'sharp' command. Is it installed?")?;
+		.context("Failed to execute SHARP")?;
 
 	if !output.status.success() {
 		let stderr = String::from_utf8_lossy(&output.stderr);
@@ -79,14 +88,10 @@ pub async fn generate_splat_from_image(
 	Ok(ply_path)
 }
 
-/// Check if SHARP CLI is available in PATH
-pub async fn check_sharp_available() -> Result<bool> {
-	let output = tokio::process::Command::new("sharp")
-		.arg("--help")
-		.output()
-		.await;
-
-	Ok(output.is_ok())
+/// Check if SHARP is available (both executable and model downloaded)
+pub async fn check_sharp_available(data_dir: &Path) -> Result<bool> {
+	let manager = crate::ops::models::SharpManager::new(data_dir);
+	Ok(manager.is_available().await)
 }
 
 /// Check if an image type is supported for splat generation

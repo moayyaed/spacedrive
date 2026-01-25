@@ -10,6 +10,8 @@ pub enum ModelType {
 	Whisper,
 	/// Tesseract OCR language data
 	Tesseract,
+	/// SHARP 3D Gaussian splat generation
+	Sharp,
 }
 
 /// Model provider

@@ -1,6 +1,10 @@
 //! Model download job with progress tracking
 
-use super::{types::ModelInfo, whisper::WhisperModel};
+use super::{
+	sharp::{SharpExecutable, SharpModel},
+	types::ModelInfo,
+	whisper::WhisperModel,
+};
 use crate::infra::job::{prelude::*, traits::DynJob};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -64,6 +68,21 @@ impl ModelDownloadJob {
 			data_dir,
 		})
 	}
+
+	pub fn for_sharp_executable(data_dir: PathBuf) -> Option<Self> {
+		let platform = SharpExecutable::current_platform()?;
+		Some(Self::new(ModelDownloadConfig {
+			model_id: platform.id().to_string(),
+			data_dir,
+		}))
+	}
+
+	pub fn for_sharp_model(data_dir: PathBuf) -> Self {
+		Self::new(ModelDownloadConfig {
+			model_id: SharpModel::ID.to_string(),
+			data_dir,
+		})
+	}
 }
 
 impl Job for ModelDownloadJob {
@@ -122,7 +141,48 @@ impl ModelDownloadJob {
 			self.config.model_id
 		));
 
-		// Parse model ID and get download info
+		// Handle SHARP executable downloads
+		if self.config.model_id.starts_with("sharp-exec-") {
+			if let Some(platform) = SharpExecutable::current_platform() {
+				let sharp_dir = super::get_sharp_dir(&self.config.data_dir);
+				tokio::fs::create_dir_all(&sharp_dir).await?;
+
+				self.state.download_url = platform.download_url();
+				self.state.target_path = sharp_dir.join(platform.filename());
+				self.state.temp_path = sharp_dir.join(format!("{}.tmp", platform.filename()));
+				self.state.total_bytes = platform.size_bytes();
+
+				ctx.log(format!(
+					"Downloading SHARP executable for {} ({} MB)",
+					platform.archive_name(),
+					self.state.total_bytes / 1024 / 1024
+				));
+
+				return Ok(());
+			} else {
+				return Err(JobError::execution("Unsupported platform for SHARP".into()));
+			}
+		}
+
+		// Handle SHARP model downloads
+		if self.config.model_id == SharpModel::ID {
+			let sharp_dir = super::get_sharp_dir(&self.config.data_dir);
+			tokio::fs::create_dir_all(&sharp_dir).await?;
+
+			self.state.download_url = SharpModel::download_url().to_string();
+			self.state.target_path = sharp_dir.join(SharpModel::FILENAME);
+			self.state.temp_path = self.state.target_path.with_extension("tmp");
+			self.state.total_bytes = SharpModel::size_bytes();
+
+			ctx.log(format!(
+				"Downloading SHARP model ({} MB) from Apple CDN",
+				self.state.total_bytes / 1024 / 1024
+			));
+
+			return Ok(());
+		}
+
+		// Handle Whisper model downloads
 		if let Some(model) = WhisperModel::from_str(&self.config.model_id.replace("whisper-", "")) {
 			let models_dir = super::get_whisper_models_dir(&self.config.data_dir);
 			tokio::fs::create_dir_all(&models_dir).await?;
@@ -137,14 +197,14 @@ impl ModelDownloadJob {
 				model.display_name(),
 				self.state.total_bytes / 1024 / 1024
 			));
-		} else {
-			return Err(JobError::execution(format!(
-				"Unknown model ID: {}",
-				self.config.model_id
-			)));
+
+			return Ok(());
 		}
 
-		Ok(())
+		Err(JobError::execution(format!(
+			"Unknown model ID: {}",
+			self.config.model_id
+		)))
 	}
 
 	async fn download(&mut self, ctx: &JobContext<'_>) -> JobResult<()> {
@@ -227,25 +287,121 @@ impl ModelDownloadJob {
 	async fn verify(&mut self, ctx: &JobContext<'_>) -> JobResult<()> {
 		ctx.log("Verifying download...");
 
-		// Check file size
-		let metadata = tokio::fs::metadata(&self.state.temp_path)
-			.await
-			.map_err(|e| JobError::execution(format!("Failed to read temp file: {}", e)))?;
+		// Check if this is an archive that needs extraction
+		let is_archive = self.state.download_url.ends_with(".tar.gz")
+			|| self.state.download_url.ends_with(".zip");
 
-		if metadata.len() != self.state.total_bytes {
-			return Err(JobError::execution(format!(
-				"Downloaded file size mismatch: expected {} bytes, got {} bytes",
-				self.state.total_bytes,
-				metadata.len()
-			)));
+		if is_archive {
+			// Extract archive
+			ctx.log("Extracting archive...");
+			self.extract_archive(ctx).await?;
+		} else {
+			// Check file size
+			let metadata = tokio::fs::metadata(&self.state.temp_path)
+				.await
+				.map_err(|e| JobError::execution(format!("Failed to read temp file: {}", e)))?;
+
+			if metadata.len() != self.state.total_bytes {
+				return Err(JobError::execution(format!(
+					"Downloaded file size mismatch: expected {} bytes, got {} bytes",
+					self.state.total_bytes,
+					metadata.len()
+				)));
+			}
+
+			// Move to final location
+			tokio::fs::rename(&self.state.temp_path, &self.state.target_path)
+				.await
+				.map_err(|e| JobError::execution(format!("Failed to move file: {}", e)))?;
 		}
 
-		// Move to final location
-		tokio::fs::rename(&self.state.temp_path, &self.state.target_path)
-			.await
-			.map_err(|e| JobError::execution(format!("Failed to move file: {}", e)))?;
-
 		ctx.log("Verification complete");
+
+		Ok(())
+	}
+
+	async fn extract_archive(&mut self, ctx: &JobContext<'_>) -> JobResult<()> {
+		use std::fs::File;
+		use std::io::{BufReader, Read};
+
+		let temp_path = self.state.temp_path.clone();
+		let target_path = self.state.target_path.clone();
+
+		// Extract in blocking task to avoid blocking async runtime
+		tokio::task::spawn_blocking(move || {
+			if temp_path.extension().and_then(|s| s.to_str()) == Some("zip") {
+				// Extract ZIP (Windows)
+				let file = File::open(&temp_path)
+					.map_err(|e| JobError::execution(format!("Failed to open zip: {}", e)))?;
+				let mut archive = zip::ZipArchive::new(BufReader::new(file))
+					.map_err(|e| JobError::execution(format!("Failed to read zip: {}", e)))?;
+
+				// Find the executable in the archive
+				for i in 0..archive.len() {
+					let mut file = archive.by_index(i).map_err(|e| {
+						JobError::execution(format!("Failed to read zip entry: {}", e))
+					})?;
+
+					if file.name().ends_with("sharp.exe") || file.name().ends_with("sharp") {
+						let mut out_file = File::create(&target_path).map_err(|e| {
+							JobError::execution(format!("Failed to create target file: {}", e))
+						})?;
+						std::io::copy(&mut file, &mut out_file).map_err(|e| {
+							JobError::execution(format!("Failed to extract file: {}", e))
+						})?;
+						break;
+					}
+				}
+			} else {
+				// Extract TAR.GZ (macOS/Linux)
+				let file = File::open(&temp_path)
+					.map_err(|e| JobError::execution(format!("Failed to open archive: {}", e)))?;
+				let gz = flate2::read::GzDecoder::new(BufReader::new(file));
+				let mut archive = tar::Archive::new(gz);
+
+				// Extract entries
+				for entry in archive.entries().map_err(|e| {
+					JobError::execution(format!("Failed to read archive entries: {}", e))
+				})? {
+					let mut entry = entry.map_err(|e| {
+						JobError::execution(format!("Failed to read archive entry: {}", e))
+					})?;
+
+					let path = entry.path().map_err(|e| {
+						JobError::execution(format!("Failed to get entry path: {}", e))
+					})?;
+
+					if path.file_name().and_then(|n| n.to_str()) == Some("sharp") {
+						let mut out_file = File::create(&target_path).map_err(|e| {
+							JobError::execution(format!("Failed to create target file: {}", e))
+						})?;
+						std::io::copy(&mut entry, &mut out_file).map_err(|e| {
+							JobError::execution(format!("Failed to extract file: {}", e))
+						})?;
+
+						// Make executable on Unix
+						#[cfg(unix)]
+						{
+							use std::os::unix::fs::PermissionsExt;
+							let mut perms = out_file.metadata().unwrap().permissions();
+							perms.set_mode(0o755);
+							std::fs::set_permissions(&target_path, perms).unwrap();
+						}
+						break;
+					}
+				}
+			}
+
+			// Clean up temp archive
+			std::fs::remove_file(&temp_path)
+				.map_err(|e| JobError::execution(format!("Failed to remove temp file: {}", e)))?;
+
+			Ok::<(), JobError>(())
+		})
+		.await
+		.map_err(|e| JobError::execution(format!("Extract task panicked: {}", e)))??;
+
+		ctx.log("Archive extracted successfully");
 
 		Ok(())
 	}
